@@ -1,0 +1,117 @@
+---
+title: "ARD Pipeline"
+output: html_document
+date: '2022-04-26'
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(reshape2)
+library(igraph)
+
+qpca <- function(A,rank=0,ifscale=TRUE){
+  if(ifscale){A <- scale(as.matrix(A))[,]}
+  A.svd <- svd(A)
+  if(rank==0){
+    d <- A.svd$d
+  } else {
+    d <- A.svd$d-A.svd$d[min(rank+1,nrow(A),ncol(A))]
+  }
+  d <- d[d > 1e-8]
+  r <- length(d)
+  prop <- d^2; info <- sum(prop)/sum(A.svd$d^2);prop <- cumsum(prop/sum(prop))
+  d <- diag(d,length(d),length(d))
+  u <- A.svd$u[,1:r,drop=F]
+  v <- A.svd$v[,1:r,drop=F]
+  x <- u%*%sqrt(d)
+  y <- sqrt(d)%*%t(v)
+  z <- x %*% y
+  rlt <- list(rank=r,X=x,Y=y,Z=x%*%y,prop=prop,info=info)
+  return(rlt)
+}
+
+```
+
+## Feature Selection
+
+```{r rawdata}
+
+setwd('/Users/wenrurumon/Documents/postdoc/ard')
+load('forard0425.rda')
+map2 <- openxlsx::read.xlsx('newgroup.xlsx')
+# load('/Users/wenrurumon/Documents/postdoc/hexinduilie/output_19group')
+# raw <- t(read.table('perfect.table.20220111',header=T,row.names=1))
+# map <- map %>% mutate(type=ifelse(group%in%c('Bioelectrcity','Cell','Proteome','RNA'),'Micro','Macro'))
+# save(raw,map,file='forard0425.rda')
+map <- map %>% select(-type) %>% merge(map2,by='group')
+map %>% group_by(type,group) %>% summarise(total_phenotypes=n())
+
+#Filter by Observations
+raw[,colnames(raw)%in%(map %>% filter(group=='Proteome'))$phenotype] <- 
+  apply(raw[,colnames(raw)%in%(map %>% filter(group=='Proteome'))$phenotype],2,function(x){ifelse(is.na(x),0,x)})
+raw.count <- apply(raw,2,function(x){sum(!is.na(x))})
+map <- data.table(phenotype=names(raw.count),obs=raw.count) %>% merge(map %>% select(phenotype,group,type),by='phenotype')
+
+#Filter by Correlation to Aging
+age <- raw[,grep("基本信息:年龄",colnames(raw))]
+gender <- raw[,grep('基本信息:性别@女',colnames(raw))]
+raw <- raw[,colnames(raw)%in%map$phenotype,drop=F] %>% as.data.frame
+raw.cor <- t(apply(raw,2,function(x){
+  out <- cor.test(age,x,use='pair.wais')
+  c(r=as.numeric(out$estimate),p=out$p.value)
+}))
+raw.cor <- data.frame(phenotype=rownames(raw.cor),raw.cor,fdr=p.adjust(raw.cor[,2],method='fdr'))
+map <- map %>% merge(raw.cor,by='phenotype')
+
+#Summary
+map %>% group_by(type,group) %>% 
+  summarise(count=n(),obs400=sum(obs>400),`obs400&age_significant`=sum((obs>400)*(fdr<0.05)))
+map %>% summarise(count=n(),obs400=sum(obs>400),`obs400&age_significant`=sum((obs>400)*(fdr<0.05)))
+
+```
+
+## Data Process
+
+```{r process}
+
+raw <- apply(raw,2,function(x){x[is.na(x)] <- median(x,na.rm=T);x})
+raw <- scale(raw)
+sel <- which(rowSums(is.na(cbind(age,gender)))==0)
+raw <- raw[sel,]
+ref <- cbind(age,gender)[sel,]
+raw.lm <- lm(raw~ref)
+raw <- raw - predict(raw.lm)
+
+map <- map %>% filter(obs>400,fdr<0.05)
+raw <- raw[,match(map$phenotype,colnames(raw)),drop=F]
+rawu <- lapply(unique(map$group),function(i){
+  mapi <- filter(map,group==i)
+  rawi <- raw[,colnames(raw)%in%mapi$phenotype,drop=F]
+  cori <- (abs(cor(rawi))>=0.8)+0
+  gi <- components(graph_from_adjacency_matrix(cori))$membership
+  temp <- lapply(unique(gi),function(j){
+    Z <- qpca(rawi[,colnames(rawi)%in%names(which(gi==j)),drop=F])$Z[,1,drop=F]
+    colnames(Z) <- names(which(gi==j))[1]
+    Z
+  })
+  do.call(cbind,temp)
+})
+names(rawu) <- unique(map$group)
+save(rawu,map,file='rawu.rda')
+
+```
+
+## Descriptive
+
+```{r dpt}
+
+temp <- map %>% group_by(type,group) %>% summarise(n=n()) %>% arrange(desc(type),desc(n))
+temp$group <- factor(temp$group,temp$group)
+ggplot(temp) + 
+  geom_col(aes(y=group,x=log(n),fill=type)) +
+  geom_text(aes(y=group,x=log(n),label=n))
+
+```
